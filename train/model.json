@@ -1,0 +1,27 @@
+{
+    "model": {
+        "model_name": "/path/to/Qwen2.5-7B",
+        "model_dtype": "bf16",
+        "model_method": null,
+        "model_structure": null,
+        "save_ckp": null,
+        "load_ckp": null,
+        "config": "config/full.json",
+        "device_map": null
+    },
+
+    "train": {
+        "train_iters": 256,
+        "max_lr": 5e-5,
+        "warmup": 0,
+        "beta1": 0.9,
+        "beta2": 0.98,
+        "weight_decay": 0,
+        "corpus": [
+            {
+                "data": "data/slimpajama/arxiv-pack-256k.pth",
+                "partition": 1.0
+            }
+        ]
+    }
+}

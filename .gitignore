@@ -1,0 +1,20 @@
+# checkpoints & model files
+ckp/*
+
+# datasets
+**/__pycache__
+data
+data_cache
+copy
+LongBench
+
+# misc
+*.egg-info
+*.pyc
+*.pth
+*.jpg
+*.log
+results
+grads
+.vscode/
+visualize/

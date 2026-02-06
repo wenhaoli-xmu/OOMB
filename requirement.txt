@@ -1,0 +1,7 @@
+torch
+pygments
+accelerate==1.10.1
+transformers==4.45.0
+datasets==2.18.0
+tokenizers==0.20.3
+triton==3.1.0
