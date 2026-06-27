@@ -1,4 +1,8 @@
-from .flash_paged_attn import flash_paged_attn_func
+from .flash_paged_attn import (
+    flash_paged_attn_distributed_func,
+    flash_paged_attn_forward_with_lse,
+    flash_paged_attn_func,
+)
 from .flash_paged_topk import flash_paged_sparse_attn_func
 from .flash_paged_moba import flash_paged_moba
 from .flash_attn import flash_attn_func
