@@ -757,7 +757,8 @@ class DistributedFlashPagedAttn(torch.autograd.Function):
     @staticmethod
     def forward(
             ctx, q, k, v, manager, group=None,
-            reduce_dtype=torch.float32, merge_backend="allreduce"):
+            reduce_dtype=torch.float32, merge_backend="allreduce",
+            fallback_to_local=True):
         import torch.distributed as dist
 
         q = q if q.stride(-1) == 1 else q.contiguous()
@@ -791,11 +792,14 @@ class DistributedFlashPagedAttn(torch.autograd.Function):
         out, global_lse = distributed_lse_merge(
             local_out, local_lse, group=group,
             backend=merge_backend, reduce_dtype=reduce_dtype,
-            fallback_to_local=False)
+            fallback_to_local=fallback_to_local)
         ctx.save_for_backward(q, out, global_lse, page_indices)
         ctx.manager = manager
         ctx.group = group
         ctx.softmax_scale = softmax_scale
+        ctx.needs_dq_all_reduce = (
+            dist.is_available() and dist.is_initialized()
+            and dist.get_world_size(group=group) > 1)
         return out
 
     @staticmethod
@@ -816,9 +820,10 @@ class DistributedFlashPagedAttn(torch.autograd.Function):
                 ctx.manager.num_kv - q.shape[1],
                 global_lse,
                 ctx.softmax_scale)
-        dist.all_reduce(dq, op=dist.ReduceOp.SUM, group=ctx.group)
+        if ctx.needs_dq_all_reduce:
+            dist.all_reduce(dq, op=dist.ReduceOp.SUM, group=ctx.group)
         dk, dv = ctx.manager.grad
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 flash_paged_attn_distributed_func = DistributedFlashPagedAttn.apply

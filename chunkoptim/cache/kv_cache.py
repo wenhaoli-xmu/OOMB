@@ -323,10 +323,12 @@ class KVCache:
         num_heads: int = 4,
         head_dim: int = 128,
         cpu_offload=None,
-        local_rank=None):
+        local_rank=None,
+        attention_conf=None):
 
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
+        self.attention_conf = attention_conf or {}
 
         MANAGER_CLS = SimpleCacheManager if cpu_offload is None else CacheManager
 
@@ -338,6 +340,8 @@ class KVCache:
                 head_dim,
                 local_rank)
             for _ in range(num_layers)]
+        for manager in self.managers:
+            manager.attention_conf = self.attention_conf
 
     def reset(self):
         for m in self.managers:

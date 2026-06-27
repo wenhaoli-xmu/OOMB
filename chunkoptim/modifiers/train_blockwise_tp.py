@@ -5,8 +5,8 @@ import torch.distributed as dist
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection
 import torch.nn.functional as F
-from ..ops import flash_paged_attn_func
 from ..ops.all_gather import _AllGather
+from .blockwise_attention import run_blockwise_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -140,7 +140,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     kv_cache[self.layer_idx].update(keys, vals, stage)
     # ================================================
 
-    attn_output = flash_paged_attn_func(
+    attn_output = run_blockwise_attention(
         ques,
         keys,
         vals,

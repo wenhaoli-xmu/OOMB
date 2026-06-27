@@ -89,6 +89,20 @@ def test_distributed_lse_merge_single_rank_uses_same_math():
     torch.testing.assert_close(global_lse, local_lse)
 
 
+def test_distributed_lse_merge_can_fallback_to_local_when_dist_uninitialized():
+    local_output = torch.randn(1, 3, 2, 4, dtype=torch.bfloat16)
+    local_lse = torch.randn(1, 2, 3, dtype=torch.float32)
+
+    combined, global_lse = distributed_lse_merge(
+        local_output, local_lse,
+        backend="allreduce",
+        reduce_dtype=torch.float32,
+        fallback_to_local=True)
+
+    torch.testing.assert_close(combined.float(), local_output.float())
+    torch.testing.assert_close(global_lse, local_lse)
+
+
 def test_distributed_lse_merge_rejects_unknown_backend():
     local_output = torch.randn(1, 1, 1, 1)
     local_lse = torch.randn(1, 1, 1)

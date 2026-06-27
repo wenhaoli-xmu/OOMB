@@ -60,6 +60,10 @@ triton==3.1.0
     | **page_size** | Default is 128 for H200. Must be set to 64 for A100. | 
     | **cpu_offload** | Choose between `null` (disabled) and `2` (enabled). | 
     | **page_budget** | The number of pages to retrieve for sparse attention. Default is 64. |
+    | **attention_backend** | Optional for `blockwise-tp`: `paged` (default), `distributed_paged`, or `rectangular`. |
+    | **attention_merge_backend** | Optional for `distributed_paged`: `allreduce` (default) or `allgather_ref`. |
+    | **attention_reduce_dtype** | Optional for `distributed_paged`: `float32` (default) or `bf16`. |
+    | **attention_fallback_to_local** | Optional for `distributed_paged`: keep `true` for single-rank smoke tests, set `false` to require an initialized distributed group. |
 
 2. Run the efficiency test script.
 
@@ -458,6 +462,10 @@ def self_attn_forward(self, hidden_states, kv_cache):
 * `SparseKVCache`, `KVCache`: Manages KV cache prefetching and the overall chunk-wise training logic.
 * `ops.flash_paged_topk.py`: Implements the attention computation for sparse paged KV cache. Offloading is transparent to this kernel.
 * `ops.flash_paged_attn.py`: Implements the attention computation for dense paged KV cache. Offloading is transparent to this kernel.
+* `modifiers.blockwise_attention.py`: Dispatches chunk-wise training attention backends, including dense paged, distributed paged, and rectangular exact reference attention.
+* `ops.distributed_attention.py`: Merges shard-local exact attention outputs using log-sum-exp statistics.
+* `ops.exact_streaming_attn.py`: Provides a PyTorch rectangular online-softmax exact attention reference.
+* `ops.ring_context_parallel.py`: Provides reference online-softmax primitives for ring-style context parallelism.
 
 ---
 
