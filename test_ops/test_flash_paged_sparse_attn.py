@@ -1,7 +1,10 @@
 import torch
+import pytest
 from chunkoptim.cache.topk_cache import SparseCacheManager
 from chunkoptim.ops.flash_paged_topk import flash_paged_sparse_attn_func
-from flash_attn import flash_attn_func
+
+flash_attn = pytest.importorskip("flash_attn")
+flash_attn_func = flash_attn.flash_attn_func
 
 
 if __name__ == '__main__':
