@@ -48,6 +48,16 @@ class SimpleCacheManager:
 
         return page_table
 
+    def page_indices_tensor(self, device=None, for_autograd=False):
+        num_pages = sum(self.last_update_pages)
+        if device is None:
+            device = self.cuda
+        if for_autograd:
+            with torch.inference_mode(False):
+                return torch.arange(num_pages, dtype=torch.int64, device=device)
+        with torch.inference_mode():
+            return torch.arange(num_pages, dtype=torch.int64, device=device)
+
     @property
     @torch.inference_mode()
     def grad(self):
@@ -144,6 +154,12 @@ class SimpleCacheManager:
 
         return key, val
     
+
+class CacheManagerSimple(SimpleCacheManager):
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, local_rank=0):
+        super().__init__(
+            batch_size, page_size, num_kv_heads, head_dim, local_rank)
+
 
 class CacheManager(SimpleCacheManager):
     def __init__(self, batch_size, page_size, num_kv_heads, head_dim, local_rank):
@@ -307,10 +323,12 @@ class KVCache:
         num_heads: int = 4,
         head_dim: int = 128,
         cpu_offload=None,
-        local_rank=None):
+        local_rank=None,
+        attention_conf=None):
 
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
+        self.attention_conf = attention_conf or {}
 
         MANAGER_CLS = SimpleCacheManager if cpu_offload is None else CacheManager
 
@@ -322,6 +340,8 @@ class KVCache:
                 head_dim,
                 local_rank)
             for _ in range(num_layers)]
+        for manager in self.managers:
+            manager.attention_conf = self.attention_conf
 
     def reset(self):
         for m in self.managers:

@@ -4,7 +4,15 @@ import torch
 import triton
 import triton.language as tl
 
+from .distributed_attention import distributed_lse_merge
 from .utils import IS_BF16_ATOM_ADD_SUPPORTED
+
+
+def validate_flash_paged_head_dim(head_dim: int):
+    if head_dim > 256:
+        raise ValueError(
+            f"flash paged attention head_dim must be <= 256, got {head_dim}")
+
 
 @triton.jit
 def _bwd_preprocess_do_o_dot(
@@ -158,6 +166,95 @@ def _fwd_kernel(
 
 
 @triton.jit
+def _fwd_indexed_kernel(
+    Q, T, PageIndices,
+    Out, Lse,
+    softmax_scale,
+    stride_qb, stride_qh, stride_qm,
+    stride_ob, stride_oh, stride_om,
+    stride_kvb, stride_kvh, stride_kvn,
+    nheads, seqlen_q, q_start_idx, headdim,
+    seqlen_q_rounded, total_seqlen_k, num_pages, num_kv_heads,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    start_m_block = tl.program_id(0)
+    off_hb = tl.program_id(1)
+    off_b = off_hb // nheads
+    off_h = off_hb % nheads
+    off_kv_h = off_h // GROUP_SIZE
+
+    offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    q_ptrs = Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
+    kv_offs = off_b * stride_kvb + off_kv_h * stride_kvh + (offs_n[:, None] * stride_kvn + offs_d[None, :])
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+
+    q_idx = q_start_idx + offs_m
+    invalid_score = -1.0e20
+
+    for page_pos in tl.range(0, num_pages):
+        page_index = tl.load(PageIndices + page_pos)
+        k_idx = page_index * BLOCK_N + offs_n
+        kv_mask = k_idx < total_seqlen_k
+
+        k_page_ptr = tl.load(T + page_pos * 4)
+        v_page_ptr = tl.load(T + page_pos * 4 + 1)
+
+        k_page_ptr = tl.cast(k_page_ptr, tl.pointer_type(tl.bfloat16))
+        v_page_ptr = tl.cast(v_page_ptr, tl.pointer_type(tl.bfloat16))
+
+        k = tl.load(k_page_ptr + kv_offs, mask=kv_mask[:, None], other=0.0)
+        v = tl.load(v_page_ptr + kv_offs, mask=kv_mask[:, None], other=0.0)
+
+        qk = tl.dot(q, k.T)
+        causal = q_idx[:, None] >= k_idx[None, :]
+        valid = causal & kv_mask[None, :]
+        qk = tl.where(valid, qk, invalid_score)
+
+        m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, m_i)
+        p = tl.exp(qk * softmax_scale - m_ij[:, None])
+        p = tl.where(valid, p, 0.0)
+        l_ij = tl.sum(p, 1)
+
+        acc_o_scale = tl.exp(m_i - m_ij)
+        acc_o = acc_o * acc_o_scale[:, None]
+        p = p.to(v.dtype)
+        acc_o += tl.dot(p, v)
+
+        m_i = m_ij
+        l_i_new = tl.exp(lse_i - m_ij) + l_ij
+        lse_i = m_ij + tl.log(l_i_new)
+
+    lse_finite = lse_i == lse_i
+    o_scale = tl.exp(m_i - lse_i)
+    o_scale = tl.where(lse_finite, o_scale, 0.0)
+    acc_o = acc_o * o_scale[:, None]
+
+    lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
+    tl.store(lse_ptrs, lse_i, mask=offs_m < seqlen_q)
+
+    out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :])
+
+    if EVEN_M:
+        tl.store(out_ptrs, acc_o)
+    else:
+        tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
+
+
+@triton.jit
 def _bwd_kernel(
     Q, DO, DQ, T,
     LSE, D,
@@ -258,6 +355,104 @@ def _bwd_kernel(
         tl.store(dq_ptrs, dq_block, mask=mask_m[:, None])
 
 
+@triton.jit
+def _bwd_indexed_kernel(
+    Q, DO, DQ, T, PageIndices,
+    LSE, D,
+    softmax_scale,
+    stride_qb, stride_qh, stride_qm,
+    stride_kvb, stride_kvh, stride_kvn,
+    stride_dob, stride_doh, stride_dom,
+    stride_dqb, stride_dqh, stride_dqm,
+    nheads, seqlen_q, q_start_idx, headdim,
+    seqlen_q_rounded, total_seqlen_k, num_pages, num_kv_heads,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    FP32_ATOMIC_ADD: tl.constexpr,
+):
+    start_m_block = tl.program_id(0)
+    off_hb = tl.program_id(1)
+    off_b = off_hb // nheads
+    off_h = off_hb % nheads
+    off_kv_h = off_h // GROUP_SIZE
+
+    offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    q_ptrs = Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
+    kv_offs = off_b * stride_kvb + off_kv_h * stride_kvh + (offs_n[:, None] * stride_kvn + offs_d[None, :])
+    do_ptrs = DO + off_b * stride_dob + off_h * stride_doh + (offs_m[:, None] * stride_dom + offs_d[None, :])
+    dq_ptrs = DQ + off_b * stride_dqb + off_h * stride_dqh + (offs_m[:, None] * stride_dqm + offs_d[None, :])
+
+    lse_ptrs = LSE + off_hb * seqlen_q_rounded + offs_m
+    d_ptrs = D + off_hb * seqlen_q_rounded + offs_m
+
+    mask_m = offs_m < seqlen_q
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+        do = tl.load(do_ptrs)
+        lse_i = tl.load(lse_ptrs)
+        Di = tl.load(d_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        lse_i = tl.load(lse_ptrs, mask=mask_m, other=0.0)
+        Di = tl.load(d_ptrs, mask=mask_m, other=0.0)
+
+    dq_block = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+    q_idx = q_start_idx + offs_m
+
+    for page_pos in tl.range(0, num_pages):
+        page_index = tl.load(PageIndices + page_pos)
+        k_idx = page_index * BLOCK_N + offs_n
+        kv_mask_1d = k_idx < total_seqlen_k
+        kv_mask = kv_mask_1d[:, None]
+
+        k_page_ptr = tl.load(T + page_pos * 4)
+        v_page_ptr = tl.load(T + page_pos * 4 + 1)
+        dk_page_ptr = tl.load(T + page_pos * 4 + 2)
+        dv_page_ptr = tl.load(T + page_pos * 4 + 3)
+
+        k_page_ptr = tl.cast(k_page_ptr, tl.pointer_type(tl.bfloat16))
+        v_page_ptr = tl.cast(v_page_ptr, tl.pointer_type(tl.bfloat16))
+        if FP32_ATOMIC_ADD:
+            dk_page_ptr = tl.cast(dk_page_ptr, tl.pointer_type(tl.float32))
+            dv_page_ptr = tl.cast(dv_page_ptr, tl.pointer_type(tl.float32))
+        else:
+            dk_page_ptr = tl.cast(dk_page_ptr, tl.pointer_type(tl.bfloat16))
+            dv_page_ptr = tl.cast(dv_page_ptr, tl.pointer_type(tl.bfloat16))
+
+        k = tl.load(k_page_ptr + kv_offs, mask=kv_mask, other=0.0)
+        v = tl.load(v_page_ptr + kv_offs, mask=kv_mask, other=0.0)
+
+        qk = tl.dot(q, k.T)
+        causal = q_idx[:, None] >= k_idx[None, :]
+        valid = causal & kv_mask_1d[None, :]
+        qk = tl.where(valid, qk, -1.0e20)
+
+        p = tl.exp(qk * softmax_scale - lse_i[:, None])
+        p = tl.where(valid, p, 0.0)
+
+        dv_block = tl.dot(p.to(do.dtype).T, do)
+        tl.atomic_add(dv_page_ptr + kv_offs, dv_block, mask=kv_mask, sem="relaxed")
+
+        dp = tl.dot(do, v.T)
+        ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+
+        dk_block = tl.dot(ds.T, q)
+        tl.atomic_add(dk_page_ptr + kv_offs, dk_block, mask=kv_mask, sem="relaxed")
+
+        dq_block += tl.dot(ds, k)
+
+    if EVEN_M:
+        tl.store(dq_ptrs, dq_block)
+    else:
+        tl.store(dq_ptrs, dq_block, mask=mask_m[:, None])
+
+
 def _flash_attn_forward(
         q: torch.Tensor,
         page_table: torch.Tensor,
@@ -274,7 +469,7 @@ def _flash_attn_forward(
     batch, seqlen_q, nheads, d = q.shape
     seqlen_k = num_kv
     
-    assert d <= 128
+    validate_flash_paged_head_dim(d)
     assert q.dtype in [torch.float16, torch.bfloat16]
     assert q.is_cuda
 
@@ -313,6 +508,63 @@ def _flash_attn_forward(
     return o, lse, softmax_scale
 
 
+def _flash_attn_indexed_forward(
+        q: torch.Tensor,
+        page_table: torch.Tensor,
+        page_indices: torch.Tensor,
+        page_size: int,
+        total_num_kv: int,
+        num_kv_heads: int,
+        kv_head_dim: int,
+        q_start_idx: int,
+        softmax_scale=None):
+
+    BLOCK_M = page_size
+    BLOCK_N = page_size
+
+    batch, seqlen_q, nheads, d = q.shape
+
+    validate_flash_paged_head_dim(d)
+    assert q.dtype in [torch.float16, torch.bfloat16]
+    assert q.is_cuda
+    assert page_indices.is_cuda
+    assert page_indices.ndim == 1
+
+    softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
+
+    seqlen_q_rounded = math.ceil(seqlen_q / BLOCK_M) * BLOCK_M
+    lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    o = torch.empty_like(q)
+
+    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    GROUP_SIZE = nheads // num_kv_heads
+
+    grid = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
+    num_warps = 4 if d <= 64 else 8
+
+    stride_kvb = page_size * num_kv_heads * kv_head_dim
+    stride_kvn = num_kv_heads * kv_head_dim
+    stride_kvh = kv_head_dim
+
+    _fwd_indexed_kernel[grid](
+        q, page_table, page_indices,
+        o, lse,
+        softmax_scale,
+        q.stride(0), q.stride(2), q.stride(1),
+        o.stride(0), o.stride(2), o.stride(1),
+        stride_kvb, stride_kvh, stride_kvn,
+        nheads, seqlen_q, q_start_idx, d,
+        seqlen_q_rounded, total_num_kv, page_indices.numel(), num_kv_heads,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_HEADDIM=BLOCK_HEADDIM,
+        EVEN_M=(seqlen_q % BLOCK_M == 0),
+        GROUP_SIZE=GROUP_SIZE,
+        num_warps=num_warps,
+        num_stages=1)
+
+    return o, lse[:, :, :seqlen_q], softmax_scale
+
+
 def _flash_attn_backward(
         o: torch.Tensor,
         do: torch.Tensor,
@@ -334,6 +586,7 @@ def _flash_attn_backward(
     BLOCK_N = page_size
 
     batch, seqlen_q, nheads, d = q.shape
+    validate_flash_paged_head_dim(d)
     seqlen_k = num_kv
     seqlen_q_rounded = math.ceil(seqlen_q / BLOCK_M) * BLOCK_M
     
@@ -369,6 +622,76 @@ def _flash_attn_backward(
         dq.stride(0), dq.stride(2), dq.stride(1),
         nheads, seqlen_q, q_start_idx, d,
         seqlen_q_rounded, seqlen_k, num_kv_heads,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_HEADDIM=BLOCK_HEADDIM,
+        EVEN_M=(seqlen_q % BLOCK_M == 0),
+        GROUP_SIZE=GROUP_SIZE,
+        FP32_ATOMIC_ADD=(not IS_BF16_ATOM_ADD_SUPPORTED),
+        num_warps=num_warps,
+        num_stages=1)
+
+
+def _flash_attn_indexed_backward(
+        o: torch.Tensor,
+        do: torch.Tensor,
+        q: torch.Tensor,
+        dq: torch.Tensor,
+        page_table: torch.Tensor,
+        page_indices: torch.Tensor,
+        page_size: int,
+        total_num_kv: int,
+        num_kv_heads: int,
+        kv_head_dim: int,
+        q_start_idx: int,
+        lse: torch.Tensor,
+        softmax_scale: float):
+    if do.stride(-1) != 1:
+        do = do.contiguous()
+    if page_indices.numel() == 0:
+        return
+
+    BLOCK_M = page_size
+    BLOCK_N = page_size
+
+    batch, seqlen_q, nheads, d = q.shape
+    validate_flash_paged_head_dim(d)
+    seqlen_q_rounded = math.ceil(seqlen_q / BLOCK_M) * BLOCK_M
+    if lse.shape[-1] != seqlen_q_rounded:
+        padded = torch.empty(
+            (batch, nheads, seqlen_q_rounded),
+            device=lse.device, dtype=lse.dtype)
+        padded[:, :, :seqlen_q] = lse
+        lse = padded
+
+    delta = torch.empty_like(lse)
+    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    GROUP_SIZE = nheads // num_kv_heads
+
+    grid_preprocess = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
+    _bwd_preprocess_do_o_dot[grid_preprocess](
+        o, do, delta,
+        o.stride(0), o.stride(2), o.stride(1),
+        do.stride(0), do.stride(2), do.stride(1),
+        nheads, seqlen_q, seqlen_q_rounded,
+        EVEN_M=(seqlen_q % BLOCK_M == 0),
+        BLOCK_M=BLOCK_M, BLOCK_HEADDIM=BLOCK_HEADDIM)
+
+    num_warps = 4 if kv_head_dim <= 64 else 8
+    stride_kvb = page_size * num_kv_heads * kv_head_dim
+    stride_kvn = num_kv_heads * kv_head_dim
+    stride_kvh = kv_head_dim
+
+    grid_bwd = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
+    _bwd_indexed_kernel[grid_bwd](
+        q, do, dq, page_table, page_indices,
+        lse, delta,
+        softmax_scale,
+        q.stride(0), q.stride(2), q.stride(1),
+        stride_kvb, stride_kvh, stride_kvn,
+        do.stride(0), do.stride(2), do.stride(1),
+        dq.stride(0), dq.stride(2), dq.stride(1),
+        nheads, seqlen_q, q_start_idx, d,
+        seqlen_q_rounded, total_num_kv, page_indices.numel(), num_kv_heads,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         EVEN_M=(seqlen_q % BLOCK_M == 0),
@@ -428,3 +751,135 @@ class FlashPagedAttn(torch.autograd.Function):
 
 
 flash_paged_attn_func = FlashPagedAttn.apply
+
+
+class DistributedFlashPagedAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx, q, k, v, manager, group=None,
+            reduce_dtype=torch.float32, merge_backend="allreduce",
+            fallback_to_local=True):
+        import torch.distributed as dist
+
+        q = q if q.stride(-1) == 1 else q.contiguous()
+        try:
+            page_indices = manager.page_indices_tensor(
+                q.device, for_autograd=True)
+        except TypeError:
+            page_indices = manager.page_indices_tensor(q.device)
+            if hasattr(torch, "is_inference") and torch.is_inference(page_indices):
+                page_indices = page_indices.clone()
+        if page_indices.numel() == 0:
+            batch, seqlen_q, nheads, _ = q.shape
+            local_out = torch.zeros_like(q)
+            local_lse = torch.full(
+                (batch, nheads, seqlen_q),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device)
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        else:
+            local_out, local_lse, softmax_scale = _flash_attn_indexed_forward(
+                q,
+                manager.page_table,
+                page_indices,
+                manager.page_size,
+                manager.num_kv,
+                manager.num_kv_heads,
+                manager.head_dim,
+                manager.num_kv - q.shape[1],
+                softmax_scale=None)
+        out, global_lse = distributed_lse_merge(
+            local_out, local_lse, group=group,
+            backend=merge_backend, reduce_dtype=reduce_dtype,
+            fallback_to_local=fallback_to_local)
+        ctx.save_for_backward(q, out, global_lse, page_indices)
+        ctx.manager = manager
+        ctx.group = group
+        ctx.softmax_scale = softmax_scale
+        ctx.needs_dq_all_reduce = (
+            dist.is_available() and dist.is_initialized()
+            and dist.get_world_size(group=group) > 1)
+        return out
+
+    @staticmethod
+    def backward(ctx, do):
+        import torch.distributed as dist
+
+        q, out, global_lse, page_indices = ctx.saved_tensors
+        dq = torch.zeros_like(q)
+        if page_indices.numel() > 0:
+            _flash_attn_indexed_backward(
+                out, do, q, dq,
+                ctx.manager.page_table,
+                page_indices,
+                ctx.manager.page_size,
+                ctx.manager.num_kv,
+                ctx.manager.num_kv_heads,
+                ctx.manager.head_dim,
+                ctx.manager.num_kv - q.shape[1],
+                global_lse,
+                ctx.softmax_scale)
+        if ctx.needs_dq_all_reduce:
+            dist.all_reduce(dq, op=dist.ReduceOp.SUM, group=ctx.group)
+        dk, dv = ctx.manager.grad
+        return dq, dk, dv, None, None, None, None, None
+
+
+flash_paged_attn_distributed_func = DistributedFlashPagedAttn.apply
+
+
+def flash_paged_attn_forward_with_lse(
+        q: torch.Tensor,
+        manager,
+        page_indices=None,
+        page_table=None,
+        total_num_kv=None,
+        q_start_idx=None):
+    """Forward-only paged attention that exposes local LSE.
+
+    If page_indices is None this runs the existing dense paged kernel over the
+    full manager. Otherwise it attends only to the listed global page indices
+    while preserving their original token positions for the causal mask.
+    """
+    q = q if q.stride(-1) == 1 else q.contiguous()
+    if page_indices is None:
+        o, lse, _ = _flash_attn_forward(
+            q,
+            manager.page_table,
+            manager.page_size,
+            manager.num_kv,
+            manager.num_kv_heads,
+            manager.head_dim,
+            manager.num_kv - q.shape[1],
+            softmax_scale=None)
+        return o, lse[:, :, :q.shape[1]]
+
+    if not torch.is_tensor(page_indices):
+        page_indices = torch.tensor(
+            page_indices, dtype=torch.int64, device=q.device)
+    else:
+        page_indices = page_indices.to(device=q.device, dtype=torch.int64)
+    if page_indices.numel() == 0:
+        batch, seqlen_q, nheads, _ = q.shape
+        return (
+            torch.zeros_like(q),
+            torch.full(
+                (batch, nheads, seqlen_q),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device))
+    if page_table is None:
+        page_table = manager.page_table.index_select(0, page_indices)
+    o, lse, _ = _flash_attn_indexed_forward(
+        q,
+        page_table,
+        page_indices,
+        manager.page_size,
+        manager.num_kv if total_num_kv is None else total_num_kv,
+        manager.num_kv_heads,
+        manager.head_dim,
+        ((manager.num_kv if total_num_kv is None else total_num_kv)
+         - q.shape[1]) if q_start_idx is None else q_start_idx,
+        softmax_scale=None)
+    return o, lse

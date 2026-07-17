@@ -268,7 +268,11 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
         kv_cache.post_process()
 
 
-def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
+def blockwise_tensor_parallel(
+        model, batch, grad_ckpt, block_size, page_size, cpu_offload,
+        attention_backend="paged", attention_merge_backend="allreduce",
+        attention_reduce_dtype="float32", attention_query_block_size=128,
+        attention_kv_block_size=128, attention_fallback_to_local=True):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
     input_ids = list(my_chunkize(batch['input_ids']))
     labels = list(my_chunkize(batch['labels']))
@@ -281,7 +285,15 @@ def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cp
             batch_size=1,
             page_size=page_size,
             num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=cpu_offload)
+            cpu_offload=cpu_offload,
+            attention_conf={
+                "backend": attention_backend,
+                "merge_backend": attention_merge_backend,
+                "reduce_dtype": attention_reduce_dtype,
+                "fallback_to_local": attention_fallback_to_local,
+                "query_block_size": attention_query_block_size,
+                "kv_block_size": attention_kv_block_size,
+            })
     dist.barrier()
     if dist.get_rank() != 0:
         kv_cache = KVCache(
@@ -289,7 +301,15 @@ def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cp
             batch_size=1,
             page_size=page_size,
             num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=cpu_offload)
+            cpu_offload=cpu_offload,
+            attention_conf={
+                "backend": attention_backend,
+                "merge_backend": attention_merge_backend,
+                "reduce_dtype": attention_reduce_dtype,
+                "fallback_to_local": attention_fallback_to_local,
+                "query_block_size": attention_query_block_size,
+                "kv_block_size": attention_kv_block_size,
+            })
     dist.barrier()
 
     with torch.no_grad():
